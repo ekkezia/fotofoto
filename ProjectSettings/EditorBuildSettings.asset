@@ -1,0 +1,38 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1045 &1
+EditorBuildSettings:
+  m_ObjectHideFlags: 0
+  serializedVersion: 2
+  m_Scenes:
+  - enabled: 0
+    path: Assets/Samples/3 QRCodeTracking/QRCodeTracking.unity
+    guid: 987cb8b6148ad48e2882cf1a7a847068
+  - enabled: 0
+    path: Assets/fotofoto - final.unity
+    guid: ffaf321dcf11f498c914c08f072fb52b
+  - enabled: 0
+    path: Assets/week-9-hw.unity
+    guid: a3c276337c1c643cc9eb9a2e99cfb0bc
+  - enabled: 0
+    path: Assets/fotofoto/solo foto.unity
+    guid: d66d4c06e473349b1a51550c49b79af7
+  - enabled: 0
+    path: Assets/Samples/7 QRCodeDetection/QRCodeDetection.unity
+    guid: 8b94352aa29d6894d8e73966f3ee47d0
+  - enabled: 0
+    path: "Assets/Samples/Meta XR Interaction \u200BSDK/81.0.0/Example Scenes/PoseExamples.unity"
+    guid: 4fe358b21fe17764db89a9ab9f202327
+  - enabled: 1
+    path: Assets/fotofoto/instructions.unity
+    guid: 820faa04cb68e4cc8be8ac73836f2a3f
+  - enabled: 0
+    path: Assets/tester button.unity
+    guid: 08882890edf904913be620d075092c09
+  m_configObjects:
+    Unity.XR.Oculus.Settings: {fileID: 11400000, guid: 1f6e424bb69784f8e8b5df6563fe45de, type: 2}
+    com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 052faaac586de48259a63d0c4782560b, type: 3}
+    com.unity.xr.arfoundation.simulation_settings: {fileID: 11400000, guid: d63e8f9f1a3d63949ba98bb0104edb75, type: 2}
+    com.unity.xr.management.loader_settings: {fileID: 11400000, guid: a1a3bb74343034748bfcead56c6c2da6, type: 2}
+    com.unity.xr.openxr.settings4: {fileID: 11400000, guid: 232818ccf539e994c9a9642b8a679f17, type: 2}
+  m_UseUCBPForAssetBundles: 0
