@@ -3,7 +3,7 @@
 **Fotofoto** is a Unity-based Mixed Reality app that lets users **capture photos directly in MR space** using intuitive **hand gestures**, then **remix, arrange, save, and reload** them as spatial image planes.  
 Photos can also be imported by scanning a **QR code**, allowing users to blend new MR snapshots with existing images.
 
-The app is built using the **Meta Interaction SDK**, **NuGet** for asset-loading dependencies, and the **Webcam Passthrough Manager** from Rob’s open-source QuestCameraKit project.
+The app is built using the **Meta Interaction SDK**, **NuGet** for asset-loading dependencies, and the **Webcam Passthrough Manager** from @xrdevrob’s open-source QuestCameraKit project.
 
 ---
 
