@@ -2,6 +2,9 @@ using UnityEngine;
 using TMPro;
 using System.Collections.Generic;
 using System.Linq;
+using System;
+using System.IO;
+
 
 /// <summary>
 /// Manages navigation between instruction panels
@@ -30,6 +33,7 @@ public class PanelNavigationManager : MonoBehaviour
     [Header("Capture Systems")]
     [SerializeField] private LiveMaskAndCapture liveMaskAndCapture;
     [SerializeField] private QRCodeDetection qrCodeDetection;
+    [SerializeField] private GameObject animatedInstructionHand; // Optional: assign the "instruction" hand object directly
 
     [Header("Save Panel")]
     [SerializeField] private TMP_InputField fileNameInputField; // Assign the input field from Save Panel
@@ -63,8 +67,10 @@ public class PanelNavigationManager : MonoBehaviour
     [SerializeField] private HandGestureDetector handGestureDetector;
     [SerializeField] private float noLShapeDelay = 2f; // Delay before showing menu when no L-shape detected
 
+    [Header("Saving to Local Device")]
     private float noLShapeTimer = 0f;
     private bool menuVisible = false;
+    private bool isSavingToDevice = false;
 
     private void Awake()
     {
@@ -372,6 +378,437 @@ if (liveMaskAndCapture != null)
         }
 
         Debug.Log($"[PanelNavigationManager] ★★★ Save button cooldown complete after {saveButtonCooldown}s");
+    }
+
+    // ========================================
+    // SAVE TO LOCAL DEVICE FUNCTIONALITY
+    // ========================================
+
+     /// <summary>
+    /// Alternative save mode: capture a full-screen screenshot of the current app view
+    /// and save it to persistent storage. On Android this requests a media scan so
+    /// the image appears in the system Gallery. Keeps the existing SaveAllCaptures
+    /// functionality separate.
+    /// Attach this to a separate Save-to-Device button (recommended) or call from UI.
+    /// </summary>
+    public void OnExecuteSaveToDevice()
+    {
+        Debug.LogError("[PanelNavigationManager] ★★★★★★ OnExecuteSaveToDevice button clicked ★★★★★★");
+        TriggerSaveToDevice("button");
+    }
+
+    private void TriggerSaveToDevice(string source)
+    {
+        if (isSavingToDevice)
+        {
+            Debug.LogWarning($"[PanelNavigationManager] SaveToDevice already running, ignored source={source}");
+            return;
+        }
+
+        if (source == "button")
+        {
+            ShowAndroidToast("Download clicked");
+            PlayButtonClickSound();
+        }
+        else
+        {
+            ShowAndroidToast("Saving photo...");
+        }
+
+        StartCoroutine(SaveCaptureToDeviceRoutine());
+    }
+
+    private System.Collections.IEnumerator SaveCaptureToDeviceRoutine()
+    {
+        isSavingToDevice = true;
+
+        // Hide instruction/navigation UI before capture so it won't appear in screenshot.
+        // Do NOT deactivate the whole canvas GameObject here, otherwise this coroutine can stop
+        // if this component lives under that canvas hierarchy.
+        CanvasGroup navCanvasGroup = null;
+        float prevAlpha = 1f;
+        bool prevInteractable = true;
+        bool prevBlocksRaycasts = true;
+        bool restoreCanvasGroup = false;
+        if (navigationCanvas != null)
+        {
+            navCanvasGroup = navigationCanvas.GetComponent<CanvasGroup>();
+            if (navCanvasGroup == null)
+            {
+                navCanvasGroup = navigationCanvas.AddComponent<CanvasGroup>();
+            }
+
+            prevAlpha = navCanvasGroup.alpha;
+            prevInteractable = navCanvasGroup.interactable;
+            prevBlocksRaycasts = navCanvasGroup.blocksRaycasts;
+
+            navCanvasGroup.alpha = 0f;
+            navCanvasGroup.interactable = false;
+            navCanvasGroup.blocksRaycasts = false;
+            restoreCanvasGroup = true;
+        }
+
+        // Hide animated instruction hand during screenshot (if present)
+        GameObject handToHide = ResolveAnimatedInstructionHand();
+        bool restoreHand = false;
+        bool handWasActive = false;
+        if (handToHide != null)
+        {
+            handWasActive = handToHide.activeSelf;
+            if (handWasActive)
+            {
+                handToHide.SetActive(false);
+                restoreHand = true;
+            }
+        }
+
+        // Wait one frame for UI hide to apply, then capture at end of frame
+        yield return null;
+        yield return new WaitForEndOfFrame();
+
+        string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        string fileName = $"fotofoto_{timestamp}.png";
+        string path = Path.Combine(Application.persistentDataPath, fileName);
+        bool saved = false;
+
+        Texture2D screenshot = null;
+        try
+        {
+            // Capture full-screen to Texture2D
+            screenshot = ScreenCapture.CaptureScreenshotAsTexture();
+
+            if (screenshot == null)
+            {
+                Debug.LogError("[PanelNavigationManager] ❌ Screenshot capture returned NULL, will try fallback CaptureScreenshot()");
+            }
+            else
+            {
+                byte[] png = screenshot.EncodeToPNG();
+                File.WriteAllBytes(path, png);
+                Debug.LogError($"[PanelNavigationManager] ✓ Screenshot saved to: {path}");
+                saved = true;
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[PanelNavigationManager] ❌ SaveCaptureToDevice error: {e.Message}\n{e.StackTrace}");
+        }
+        finally
+        {
+            if (screenshot != null)
+            {
+                UnityEngine.Object.Destroy(screenshot);
+            }
+        }
+
+        // Fallback: some XR paths return null texture; this API writes screenshot directly.
+        if (!saved)
+        {
+            bool fallbackStarted = false;
+            try
+            {
+                ScreenCapture.CaptureScreenshot(path);
+                fallbackStarted = true;
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[PanelNavigationManager] ❌ Fallback CaptureScreenshot error: {e.Message}\n{e.StackTrace}");
+            }
+
+            if (fallbackStarted)
+            {
+                float timeout = 2.0f;
+                float elapsed = 0f;
+                while (elapsed < timeout && !File.Exists(path))
+                {
+                    elapsed += Time.unscaledDeltaTime;
+                    yield return null;
+                }
+                saved = File.Exists(path);
+                Debug.LogError(saved
+                    ? $"[PanelNavigationManager] ✓ Fallback screenshot saved to: {path}"
+                    : $"[PanelNavigationManager] ❌ Fallback screenshot not found after {timeout:F1}s: {path}");
+            }
+        }
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (saved)
+        {
+            bool publishedToPictures = TrySavePngToAndroidPictures(path, fileName, out string mediaStoreUri);
+            if (publishedToPictures)
+            {
+                Debug.LogError($"[PanelNavigationManager] ✓ Published to Android Download/fotofoto: {mediaStoreUri}");
+                ShowAndroidToast("Saved to Download/fotofoto");
+            }
+            else
+            {
+                bool insertedToGallery = TryInsertImageIntoAndroidGallery(path, fileName, out string galleryUriOrPath);
+                if (insertedToGallery)
+                {
+                    Debug.LogError($"[PanelNavigationManager] ✓ Saved via MediaStore.insertImage: {galleryUriOrPath}");
+                    ShowAndroidToast("Saved to Gallery");
+                }
+                else
+                {
+                    Debug.LogError("[PanelNavigationManager] ❌ Failed to publish into MediaStore Download/Gallery, attempting media scan fallback");
+                    TryRequestAndroidMediaScan(path);
+                    ShowAndroidToast("Saved to app storage only");
+                }
+            }
+
+        }
+        else
+        {
+            ShowAndroidToast("Save failed. Check logcat.");
+        }
+#elif UNITY_IOS && !UNITY_EDITOR
+        Debug.LogError("[PanelNavigationManager] iOS: to save to Photos install NativeGallery or implement native bridge (NSPhotoLibraryAddUsageDescription required).");
+#else
+        Debug.LogError(saved
+            ? "[PanelNavigationManager] Non-mobile platform - screenshot saved to persistentDataPath."
+            : "[PanelNavigationManager] Non-mobile platform - screenshot save failed.");
+#endif
+
+        // Restore instruction/navigation UI after capture attempt
+        if (restoreCanvasGroup && navCanvasGroup != null)
+        {
+            navCanvasGroup.alpha = prevAlpha;
+            navCanvasGroup.interactable = prevInteractable;
+            navCanvasGroup.blocksRaycasts = prevBlocksRaycasts;
+        }
+
+        if (restoreHand && handToHide != null)
+        {
+            handToHide.SetActive(handWasActive);
+        }
+
+        isSavingToDevice = false;
+    }
+
+    private GameObject ResolveAnimatedInstructionHand()
+    {
+        if (animatedInstructionHand != null)
+        {
+            return animatedInstructionHand;
+        }
+
+        // Most common location in this scene
+        if (soloFotoPanel != null)
+        {
+            Transform child = soloFotoPanel.transform.Find("instruction");
+            if (child != null)
+            {
+                return child.gameObject;
+            }
+        }
+
+        // Fallback: locate active/inactive object named "instruction" with Animator
+        Animator[] animators = UnityEngine.Object.FindObjectsOfType<Animator>(true);
+        foreach (var animator in animators)
+        {
+            if (animator != null &&
+                animator.gameObject != null &&
+                string.Equals(animator.gameObject.name, "instruction", StringComparison.OrdinalIgnoreCase))
+            {
+                return animator.gameObject;
+            }
+        }
+
+        return null;
+    }
+
+    private void ShowAndroidToast(string message)
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        try
+        {
+            using (var unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer"))
+            using (var activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity"))
+            using (var toastClass = new AndroidJavaClass("android.widget.Toast"))
+            {
+                activity.Call("runOnUiThread", new AndroidJavaRunnable(() =>
+                {
+                    var toast = toastClass.CallStatic<AndroidJavaObject>("makeText", activity, message, 0);
+                    toast.Call("show");
+                }));
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[PanelNavigationManager] Failed to show Android toast: {e.Message}");
+        }
+#endif
+    }
+
+    private bool TrySavePngToAndroidPictures(string sourcePath, string fileName, out string mediaStoreUri)
+    {
+        mediaStoreUri = null;
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (string.IsNullOrEmpty(sourcePath) || !File.Exists(sourcePath))
+        {
+            Debug.LogError($"[PanelNavigationManager] Source file missing for MediaStore publish: {sourcePath}");
+            return false;
+        }
+
+        byte[] pngBytes;
+        try
+        {
+            pngBytes = File.ReadAllBytes(sourcePath);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[PanelNavigationManager] Failed reading screenshot bytes for MediaStore publish: {e.Message}");
+            return false;
+        }
+
+        try
+        {
+            using (var unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer"))
+            using (var activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity"))
+            using (var resolver = activity.Call<AndroidJavaObject>("getContentResolver"))
+            using (var mediaStoreDownloads = new AndroidJavaClass("android.provider.MediaStore$Downloads"))
+            using (var mediaColumns = new AndroidJavaClass("android.provider.MediaStore$MediaColumns"))
+            using (var values = new AndroidJavaObject("android.content.ContentValues"))
+            using (var buildVersion = new AndroidJavaClass("android.os.Build$VERSION"))
+            {
+                int sdkInt = buildVersion.GetStatic<int>("SDK_INT");
+                string displayNameCol = mediaColumns.GetStatic<string>("DISPLAY_NAME");
+                string mimeTypeCol = mediaColumns.GetStatic<string>("MIME_TYPE");
+                string relativePathCol = mediaColumns.GetStatic<string>("RELATIVE_PATH");
+                string isPendingCol = mediaColumns.GetStatic<string>("IS_PENDING");
+
+                values.Call("put", displayNameCol, fileName);
+                values.Call("put", mimeTypeCol, "image/png");
+                values.Call("put", relativePathCol, "Download/fotofoto");
+                if (sdkInt >= 29)
+                {
+                    using (var one = new AndroidJavaObject("java.lang.Integer", 1))
+                    {
+                        values.Call("put", isPendingCol, one);
+                    }
+                }
+
+                using (var collection = mediaStoreDownloads.GetStatic<AndroidJavaObject>("EXTERNAL_CONTENT_URI"))
+                using (var itemUri = resolver.Call<AndroidJavaObject>("insert", collection, values))
+                {
+                    if (itemUri == null)
+                    {
+                        Debug.LogError("[PanelNavigationManager] MediaStore insert returned null URI");
+                        return false;
+                    }
+
+                    using (var outStream = resolver.Call<AndroidJavaObject>("openOutputStream", itemUri))
+                    {
+                        if (outStream == null)
+                        {
+                            Debug.LogError("[PanelNavigationManager] MediaStore openOutputStream returned null");
+                            return false;
+                        }
+                        outStream.Call("write", pngBytes);
+                        outStream.Call("flush");
+                    }
+
+                    if (sdkInt >= 29)
+                    {
+                        using (var pendingValues = new AndroidJavaObject("android.content.ContentValues"))
+                        {
+                            using (var zero = new AndroidJavaObject("java.lang.Integer", 0))
+                            {
+                                pendingValues.Call("put", isPendingCol, zero);
+                            }
+                            resolver.Call<int>("update", itemUri, pendingValues, null, null);
+                        }
+                    }
+
+                    mediaStoreUri = itemUri.Call<string>("toString");
+                    return true;
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[PanelNavigationManager] MediaStore publish failed: {e.Message}\n{e.StackTrace}");
+            return false;
+        }
+#else
+        return false;
+#endif
+    }
+
+    private void TryRequestAndroidMediaScan(string path)
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        try
+        {
+            using (var unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer"))
+            using (var activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity"))
+            using (var mediaScanner = new AndroidJavaClass("android.media.MediaScannerConnection"))
+            {
+                string[] paths = new string[] { path };
+                string[] mimeTypes = new string[] { "image/png" };
+                mediaScanner.CallStatic("scanFile", activity, paths, mimeTypes, null);
+                Debug.LogError("[PanelNavigationManager] Requested Android media scan fallback");
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[PanelNavigationManager] Android media scan fallback failed: {e.Message}");
+        }
+#endif
+    }
+
+    private bool TryInsertImageIntoAndroidGallery(string sourcePath, string title, out string imageUriOrPath)
+    {
+        imageUriOrPath = null;
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (string.IsNullOrEmpty(sourcePath) || !File.Exists(sourcePath))
+        {
+            Debug.LogError($"[PanelNavigationManager] Gallery insert source file missing: {sourcePath}");
+            return false;
+        }
+
+        try
+        {
+            byte[] png = File.ReadAllBytes(sourcePath);
+
+            using (var unityPlayer = new AndroidJavaClass("com.unity3d.player.UnityPlayer"))
+            using (var activity = unityPlayer.GetStatic<AndroidJavaObject>("currentActivity"))
+            using (var resolver = activity.Call<AndroidJavaObject>("getContentResolver"))
+            using (var bitmapFactory = new AndroidJavaClass("android.graphics.BitmapFactory"))
+            using (var mediaStoreImages = new AndroidJavaClass("android.provider.MediaStore$Images$Media"))
+            using (var bitmap = bitmapFactory.CallStatic<AndroidJavaObject>("decodeByteArray", png, 0, png.Length))
+            {
+                if (bitmap == null)
+                {
+                    Debug.LogError("[PanelNavigationManager] BitmapFactory.decodeByteArray returned null");
+                    return false;
+                }
+
+                string inserted = mediaStoreImages.CallStatic<string>(
+                    "insertImage",
+                    resolver,
+                    bitmap,
+                    title,
+                    "fotofoto capture");
+
+                if (string.IsNullOrEmpty(inserted))
+                {
+                    Debug.LogError("[PanelNavigationManager] MediaStore.insertImage returned empty path/uri");
+                    return false;
+                }
+
+                imageUriOrPath = inserted;
+                return true;
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[PanelNavigationManager] MediaStore.insertImage failed: {e.Message}\n{e.StackTrace}");
+            return false;
+        }
+#else
+        return false;
+#endif
     }
 
     // ========================================
