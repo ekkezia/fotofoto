@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System;
 using System.IO;
+using PassthroughCameraSamples;
 
 
 /// <summary>
@@ -34,6 +35,14 @@ public class PanelNavigationManager : MonoBehaviour
     [SerializeField] private LiveMaskAndCapture liveMaskAndCapture;
     [SerializeField] private QRCodeDetection qrCodeDetection;
     [SerializeField] private GameObject animatedInstructionHand; // Optional: assign the "instruction" hand object directly
+    [SerializeField] private WebCamTextureManager passthroughCameraTextureManager;
+
+    [Header("Instruction Canvas Anchoring")]
+    [SerializeField] private bool anchorInstructionCanvasToLeftHand = true;
+    [SerializeField] private Transform instructionCanvasTransform;
+    [SerializeField] private Transform leftHandInstructionAnchor;
+    [SerializeField] private Vector3 leftHandInstructionOffset = Vector3.zero;
+    [SerializeField] private float instructionCanvasAnchorSmoothing = 18f;
 
     [Header("Save Panel")]
     [SerializeField] private TMP_InputField fileNameInputField; // Assign the input field from Save Panel
@@ -71,6 +80,21 @@ public class PanelNavigationManager : MonoBehaviour
     private float noLShapeTimer = 0f;
     private bool menuVisible = false;
     private bool isSavingToDevice = false;
+    private Transform resolvedInstructionCanvasTransform;
+    private Transform resolvedLeftHandInstructionAnchor;
+    private bool hasPositionedInstructionCanvas;
+
+    private struct TemporaryHiddenObject
+    {
+        public GameObject gameObject;
+        public bool wasActive;
+
+        public TemporaryHiddenObject(GameObject gameObject, bool wasActive)
+        {
+            this.gameObject = gameObject;
+            this.wasActive = wasActive;
+        }
+    }
 
     private void Awake()
     {
@@ -189,6 +213,8 @@ if (liveMaskAndCapture != null)
 
         // Handle visibility for all "Instruction" tagged objects (menu + instructions)
         HandleInstructionVisibility(totalCaptures, visibleHands);
+
+        UpdateInstructionCanvasAnchor();
     }
 
     // ========================================
@@ -250,6 +276,15 @@ if (liveMaskAndCapture != null)
     }
 
     /// <summary>
+    /// Button callback: Open the in-app save panel for naming captures so Load can restore them.
+    /// </summary>
+    public void OnSelectSaveInAppFoto()
+    {
+        Debug.Log("[PanelNavigationManager] ★★★ OnSelectSaveInAppFoto button clicked");
+        SetActivePanel(InstructionManager.InstructionPanel.SaveFoto);
+    }
+
+    /// <summary>
     /// Button callback: Execute save - Call this from the Save button in Save Panel
     /// IMPORTANT: Make sure to assign this method to the Save button's onClick event in Unity Inspector
     /// </summary>
@@ -267,20 +302,15 @@ if (liveMaskAndCapture != null)
         // Play button click sound
         PlayButtonClickSound();
 
-        // Get custom file name from input field
-        string customFileName = null;
-        if (fileNameInputField != null && !string.IsNullOrWhiteSpace(fileNameInputField.text))
+        if (fileNameInputField == null || string.IsNullOrWhiteSpace(fileNameInputField.text))
         {
-            customFileName = fileNameInputField.text.Trim();
-            Debug.LogError($"[PanelNavigationManager] Using custom file name: '{customFileName}'");
+            Debug.LogError("[PanelNavigationManager] No file name provided - skipping in-app save");
+            ShowAndroidToast("Enter a name to save in app");
+            return;
         }
-        else
-        {
-            // Generate unique default name with timestamp
-            string timestamp = System.DateTime.Now.ToString("yyyyMMdd_HHmmss");
-            customFileName = $"Image_{timestamp}";
-            Debug.LogError($"[PanelNavigationManager] No custom file name provided, using default: '{customFileName}'");
-        }
+
+        string customFileName = fileNameInputField.text.Trim();
+        Debug.LogError($"[PanelNavigationManager] Using custom file name for in-app save: '{customFileName}'");
 
         // Save all captured images
         int savedCount = 0;
@@ -422,71 +452,43 @@ if (liveMaskAndCapture != null)
     {
         isSavingToDevice = true;
 
-        // Hide instruction/navigation UI before capture so it won't appear in screenshot.
-        // Do NOT deactivate the whole canvas GameObject here, otherwise this coroutine can stop
-        // if this component lives under that canvas hierarchy.
-        CanvasGroup navCanvasGroup = null;
-        float prevAlpha = 1f;
-        bool prevInteractable = true;
-        bool prevBlocksRaycasts = true;
-        bool restoreCanvasGroup = false;
-        if (navigationCanvas != null)
-        {
-            navCanvasGroup = navigationCanvas.GetComponent<CanvasGroup>();
-            if (navCanvasGroup == null)
-            {
-                navCanvasGroup = navigationCanvas.AddComponent<CanvasGroup>();
-            }
-
-            prevAlpha = navCanvasGroup.alpha;
-            prevInteractable = navCanvasGroup.interactable;
-            prevBlocksRaycasts = navCanvasGroup.blocksRaycasts;
-
-            navCanvasGroup.alpha = 0f;
-            navCanvasGroup.interactable = false;
-            navCanvasGroup.blocksRaycasts = false;
-            restoreCanvasGroup = true;
-        }
-
-        // Hide animated instruction hand during screenshot (if present)
-        GameObject handToHide = ResolveAnimatedInstructionHand();
-        bool restoreHand = false;
-        bool handWasActive = false;
-        if (handToHide != null)
-        {
-            handWasActive = handToHide.activeSelf;
-            if (handWasActive)
-            {
-                handToHide.SetActive(false);
-                restoreHand = true;
-            }
-        }
+        List<TemporaryHiddenObject> hiddenMenuObjects = HideMenuForDeviceCapture();
 
         // Wait one frame for UI hide to apply, then capture at end of frame
         yield return null;
         yield return new WaitForEndOfFrame();
 
         string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-        string fileName = $"fotofoto_{timestamp}.png";
-        string path = Path.Combine(Application.persistentDataPath, fileName);
-        bool saved = false;
+        string fullFileName = $"fotofoto_full_{timestamp}.png";
+        string framesFileName = $"fotofoto_frames_{timestamp}.png";
+        string fullPath = Path.Combine(Application.persistentDataPath, fullFileName);
+        string framesPath = Path.Combine(Application.persistentDataPath, framesFileName);
+        bool savedFullView = false;
+        bool savedFramesOnly = false;
 
-        Texture2D screenshot = null;
+        Texture2D fullViewScreenshot = null;
+        Texture2D framesOnlyScreenshot = null;
         try
         {
-            // Capture full-screen to Texture2D
-            screenshot = ScreenCapture.CaptureScreenshotAsTexture();
+            fullViewScreenshot = CaptureDeviceViewTexture();
 
-            if (screenshot == null)
+            if (fullViewScreenshot == null)
             {
-                Debug.LogError("[PanelNavigationManager] ❌ Screenshot capture returned NULL, will try fallback CaptureScreenshot()");
+                Debug.LogError("[PanelNavigationManager] ❌ Full-view screenshot capture returned NULL, will try fallback CaptureScreenshot()");
             }
             else
             {
-                byte[] png = screenshot.EncodeToPNG();
-                File.WriteAllBytes(path, png);
-                Debug.LogError($"[PanelNavigationManager] ✓ Screenshot saved to: {path}");
-                saved = true;
+                savedFullView = TryWriteTexturePng(fullViewScreenshot, fullPath, "full camera view");
+            }
+
+            framesOnlyScreenshot = CaptureCapturedFramesOnlyTexture();
+            if (framesOnlyScreenshot == null)
+            {
+                Debug.LogError("[PanelNavigationManager] ❌ Frames-only screenshot capture returned NULL");
+            }
+            else
+            {
+                savedFramesOnly = TryWriteTexturePng(framesOnlyScreenshot, framesPath, "captured frames only");
             }
         }
         catch (Exception e)
@@ -495,19 +497,24 @@ if (liveMaskAndCapture != null)
         }
         finally
         {
-            if (screenshot != null)
+            if (fullViewScreenshot != null)
             {
-                UnityEngine.Object.Destroy(screenshot);
+                UnityEngine.Object.Destroy(fullViewScreenshot);
+            }
+
+            if (framesOnlyScreenshot != null)
+            {
+                UnityEngine.Object.Destroy(framesOnlyScreenshot);
             }
         }
 
         // Fallback: some XR paths return null texture; this API writes screenshot directly.
-        if (!saved)
+        if (!savedFullView)
         {
             bool fallbackStarted = false;
             try
             {
-                ScreenCapture.CaptureScreenshot(path);
+                ScreenCapture.CaptureScreenshot(fullPath);
                 fallbackStarted = true;
             }
             catch (Exception e)
@@ -519,43 +526,39 @@ if (liveMaskAndCapture != null)
             {
                 float timeout = 2.0f;
                 float elapsed = 0f;
-                while (elapsed < timeout && !File.Exists(path))
+                while (elapsed < timeout && !File.Exists(fullPath))
                 {
                     elapsed += Time.unscaledDeltaTime;
                     yield return null;
                 }
-                saved = File.Exists(path);
-                Debug.LogError(saved
-                    ? $"[PanelNavigationManager] ✓ Fallback screenshot saved to: {path}"
-                    : $"[PanelNavigationManager] ❌ Fallback screenshot not found after {timeout:F1}s: {path}");
+                savedFullView = File.Exists(fullPath);
+                Debug.LogError(savedFullView
+                    ? $"[PanelNavigationManager] ✓ Fallback full-view screenshot saved to: {fullPath}"
+                    : $"[PanelNavigationManager] ❌ Fallback full-view screenshot not found after {timeout:F1}s: {fullPath}");
             }
         }
 
-#if UNITY_ANDROID && !UNITY_EDITOR
-        if (saved)
-        {
-            bool publishedToPictures = TrySavePngToAndroidPictures(path, fileName, out string mediaStoreUri);
-            if (publishedToPictures)
-            {
-                Debug.LogError($"[PanelNavigationManager] ✓ Published to Android Download/fotofoto: {mediaStoreUri}");
-                ShowAndroidToast("Saved to Download/fotofoto");
-            }
-            else
-            {
-                bool insertedToGallery = TryInsertImageIntoAndroidGallery(path, fileName, out string galleryUriOrPath);
-                if (insertedToGallery)
-                {
-                    Debug.LogError($"[PanelNavigationManager] ✓ Saved via MediaStore.insertImage: {galleryUriOrPath}");
-                    ShowAndroidToast("Saved to Gallery");
-                }
-                else
-                {
-                    Debug.LogError("[PanelNavigationManager] ❌ Failed to publish into MediaStore Download/Gallery, attempting media scan fallback");
-                    TryRequestAndroidMediaScan(path);
-                    ShowAndroidToast("Saved to app storage only");
-                }
-            }
+        RestoreTemporarilyHiddenObjects(hiddenMenuObjects);
 
+#if UNITY_ANDROID && !UNITY_EDITOR
+        int publishedCount = 0;
+        if (savedFullView)
+        {
+            publishedCount += PublishDevicePng(fullPath, fullFileName, "full view") ? 1 : 0;
+        }
+
+        if (savedFramesOnly)
+        {
+            publishedCount += PublishDevicePng(framesPath, framesFileName, "captured frames") ? 1 : 0;
+        }
+
+        if (publishedCount == 2)
+        {
+            ShowAndroidToast("Saved full view + frames");
+        }
+        else if (publishedCount == 1)
+        {
+            ShowAndroidToast("Saved 1 photo. Check logcat.");
         }
         else
         {
@@ -564,25 +567,407 @@ if (liveMaskAndCapture != null)
 #elif UNITY_IOS && !UNITY_EDITOR
         Debug.LogError("[PanelNavigationManager] iOS: to save to Photos install NativeGallery or implement native bridge (NSPhotoLibraryAddUsageDescription required).");
 #else
-        Debug.LogError(saved
-            ? "[PanelNavigationManager] Non-mobile platform - screenshot saved to persistentDataPath."
-            : "[PanelNavigationManager] Non-mobile platform - screenshot save failed.");
+        Debug.LogError((savedFullView || savedFramesOnly)
+            ? $"[PanelNavigationManager] Non-mobile platform - saved full={savedFullView}, frames={savedFramesOnly} to persistentDataPath."
+            : "[PanelNavigationManager] Non-mobile platform - screenshot saves failed.");
 #endif
 
-        // Restore instruction/navigation UI after capture attempt
-        if (restoreCanvasGroup && navCanvasGroup != null)
-        {
-            navCanvasGroup.alpha = prevAlpha;
-            navCanvasGroup.interactable = prevInteractable;
-            navCanvasGroup.blocksRaycasts = prevBlocksRaycasts;
-        }
-
-        if (restoreHand && handToHide != null)
-        {
-            handToHide.SetActive(handWasActive);
-        }
-
         isSavingToDevice = false;
+    }
+
+    private List<TemporaryHiddenObject> HideMenuForDeviceCapture()
+    {
+        var hiddenObjects = new List<TemporaryHiddenObject>();
+
+        AddInstructionTaggedObjects(hiddenObjects);
+        AddTemporaryHiddenObject(hiddenObjects, ResolveNavigationButtonGroup());
+        AddTemporaryHiddenObject(hiddenObjects, ResolveHandMenuCanvas());
+        AddTemporaryHiddenObject(hiddenObjects, ResolveAnimatedInstructionHand());
+
+        Debug.LogError($"[PanelNavigationManager] Hidden {hiddenObjects.Count} menu object(s) for device screenshot");
+        return hiddenObjects;
+    }
+
+    private void AddInstructionTaggedObjects(List<TemporaryHiddenObject> hiddenObjects)
+    {
+        GameObject[] instructionObjects = GameObject.FindGameObjectsWithTag("Instruction");
+        foreach (var instructionObject in instructionObjects)
+        {
+            AddTemporaryHiddenObject(hiddenObjects, instructionObject);
+        }
+    }
+
+    private Texture2D CaptureDeviceViewTexture()
+    {
+        Texture2D composite = TryCaptureCameraAndAppComposite();
+        if (composite != null)
+        {
+            Debug.LogError("[PanelNavigationManager] ✓ Captured camera + app composite screenshot");
+            return composite;
+        }
+
+        Debug.LogWarning("[PanelNavigationManager] Camera composite unavailable, falling back to Unity screenshot only");
+        return ScreenCapture.CaptureScreenshotAsTexture();
+    }
+
+    private Texture2D CaptureCapturedFramesOnlyTexture()
+    {
+        Vector2Int captureSize = ResolveDeviceCaptureSize();
+        Texture2D framesOnly = CaptureAppOverlayTexture(captureSize.x, captureSize.y);
+        if (framesOnly != null)
+        {
+            Debug.LogError("[PanelNavigationManager] ✓ Captured frames-only screenshot");
+        }
+
+        return framesOnly;
+    }
+
+    private Vector2Int ResolveDeviceCaptureSize()
+    {
+        int width = Screen.width;
+        int height = Screen.height;
+
+        if (width > 16 && height > 16)
+        {
+            return new Vector2Int(width, height);
+        }
+
+        WebCamTexture cameraTexture = ResolvePassthroughWebCamTexture();
+        if (cameraTexture != null && cameraTexture.width > 16 && cameraTexture.height > 16)
+        {
+            return new Vector2Int(cameraTexture.width, cameraTexture.height);
+        }
+
+        return new Vector2Int(1024, 1024);
+    }
+
+    private bool TryWriteTexturePng(Texture2D texture, string path, string label)
+    {
+        if (texture == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            byte[] png = texture.EncodeToPNG();
+            File.WriteAllBytes(path, png);
+            Debug.LogError($"[PanelNavigationManager] ✓ Saved {label} PNG to: {path}");
+            return true;
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[PanelNavigationManager] ❌ Failed writing {label} PNG: {e.Message}\n{e.StackTrace}");
+            return false;
+        }
+    }
+
+    private bool PublishDevicePng(string path, string fileName, string label)
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        bool publishedToPictures = TrySavePngToAndroidPictures(path, fileName, out string mediaStoreUri);
+        if (publishedToPictures)
+        {
+            Debug.LogError($"[PanelNavigationManager] ✓ Published {label} to Android Download/fotofoto: {mediaStoreUri}");
+            return true;
+        }
+
+        bool insertedToGallery = TryInsertImageIntoAndroidGallery(path, fileName, out string galleryUriOrPath);
+        if (insertedToGallery)
+        {
+            Debug.LogError($"[PanelNavigationManager] ✓ Saved {label} via MediaStore.insertImage: {galleryUriOrPath}");
+            return true;
+        }
+
+        Debug.LogError($"[PanelNavigationManager] ❌ Failed to publish {label} into MediaStore Download/Gallery, attempting media scan fallback");
+        TryRequestAndroidMediaScan(path);
+        return false;
+#else
+        return File.Exists(path);
+#endif
+    }
+
+    private Texture2D TryCaptureCameraAndAppComposite()
+    {
+        WebCamTexture cameraTexture = ResolvePassthroughWebCamTexture();
+        if (cameraTexture == null || !cameraTexture.isPlaying || cameraTexture.width <= 16 || cameraTexture.height <= 16)
+        {
+            Debug.LogWarning("[PanelNavigationManager] Passthrough WebCamTexture not ready for camera composite");
+            return null;
+        }
+
+        int targetWidth = Screen.width > 16 ? Screen.width : cameraTexture.width;
+        int targetHeight = Screen.height > 16 ? Screen.height : cameraTexture.height;
+
+        Texture2D cameraBackground = null;
+        Texture2D appOverlay = null;
+        try
+        {
+            cameraBackground = CreateCameraBackgroundTexture(cameraTexture, targetWidth, targetHeight);
+            appOverlay = CaptureAppOverlayTexture(targetWidth, targetHeight);
+
+            if (cameraBackground == null || appOverlay == null)
+            {
+                if (cameraBackground != null) Destroy(cameraBackground);
+                if (appOverlay != null) Destroy(appOverlay);
+                return null;
+            }
+
+            CompositeOverlayOntoBackground(cameraBackground, appOverlay);
+            Destroy(appOverlay);
+            return cameraBackground;
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[PanelNavigationManager] Camera composite capture failed: {e.Message}\n{e.StackTrace}");
+            if (cameraBackground != null) Destroy(cameraBackground);
+            if (appOverlay != null) Destroy(appOverlay);
+            return null;
+        }
+    }
+
+    private WebCamTexture ResolvePassthroughWebCamTexture()
+    {
+        if (passthroughCameraTextureManager == null)
+        {
+            passthroughCameraTextureManager = FindAnyObjectByType<WebCamTextureManager>();
+        }
+
+        return passthroughCameraTextureManager != null ? passthroughCameraTextureManager.WebCamTexture : null;
+    }
+
+    private Texture2D CreateCameraBackgroundTexture(WebCamTexture cameraTexture, int targetWidth, int targetHeight)
+    {
+        Color32[] sourcePixels = cameraTexture.GetPixels32();
+        if (sourcePixels == null || sourcePixels.Length == 0)
+        {
+            Debug.LogWarning("[PanelNavigationManager] WebCamTexture returned no pixels");
+            return null;
+        }
+
+        int sourceWidth = cameraTexture.width;
+        int sourceHeight = cameraTexture.height;
+        var output = new Texture2D(targetWidth, targetHeight, TextureFormat.RGBA32, false);
+        Color32[] outputPixels = new Color32[targetWidth * targetHeight];
+
+        float sourceAspect = (float)sourceWidth / sourceHeight;
+        float targetAspect = (float)targetWidth / targetHeight;
+
+        for (int y = 0; y < targetHeight; y++)
+        {
+            for (int x = 0; x < targetWidth; x++)
+            {
+                float u = (x + 0.5f) / targetWidth;
+                float v = (y + 0.5f) / targetHeight;
+
+                if (sourceAspect > targetAspect)
+                {
+                    float visibleWidth = targetAspect / sourceAspect;
+                    u = (1f - visibleWidth) * 0.5f + u * visibleWidth;
+                }
+                else
+                {
+                    float visibleHeight = sourceAspect / targetAspect;
+                    v = (1f - visibleHeight) * 0.5f + v * visibleHeight;
+                }
+
+                ApplyWebCamOrientation(cameraTexture, ref u, ref v);
+
+                int sourceX = Mathf.Clamp(Mathf.RoundToInt(u * (sourceWidth - 1)), 0, sourceWidth - 1);
+                int sourceY = Mathf.Clamp(Mathf.RoundToInt(v * (sourceHeight - 1)), 0, sourceHeight - 1);
+                outputPixels[y * targetWidth + x] = sourcePixels[sourceY * sourceWidth + sourceX];
+            }
+        }
+
+        output.SetPixels32(outputPixels);
+        output.Apply();
+        return output;
+    }
+
+    private void ApplyWebCamOrientation(WebCamTexture cameraTexture, ref float u, ref float v)
+    {
+        if (cameraTexture.videoVerticallyMirrored)
+        {
+            v = 1f - v;
+        }
+
+        int rotation = ((cameraTexture.videoRotationAngle % 360) + 360) % 360;
+        switch (rotation)
+        {
+            case 90:
+                float rotatedU90 = v;
+                float rotatedV90 = 1f - u;
+                u = rotatedU90;
+                v = rotatedV90;
+                break;
+            case 180:
+                u = 1f - u;
+                v = 1f - v;
+                break;
+            case 270:
+                float rotatedU270 = 1f - v;
+                float rotatedV270 = u;
+                u = rotatedU270;
+                v = rotatedV270;
+                break;
+        }
+    }
+
+    private Texture2D CaptureAppOverlayTexture(int targetWidth, int targetHeight)
+    {
+        Camera cameraToRender = ResolveScreenshotCamera();
+        if (cameraToRender == null)
+        {
+            Debug.LogWarning("[PanelNavigationManager] No camera available for app overlay capture");
+            return null;
+        }
+
+        RenderTexture renderTexture = RenderTexture.GetTemporary(targetWidth, targetHeight, 24, RenderTextureFormat.ARGB32);
+        RenderTexture previousTarget = cameraToRender.targetTexture;
+        RenderTexture previousActive = RenderTexture.active;
+        CameraClearFlags previousClearFlags = cameraToRender.clearFlags;
+        Color previousBackgroundColor = cameraToRender.backgroundColor;
+
+        try
+        {
+            cameraToRender.targetTexture = renderTexture;
+            cameraToRender.clearFlags = CameraClearFlags.SolidColor;
+            cameraToRender.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            cameraToRender.Render();
+
+            RenderTexture.active = renderTexture;
+            Texture2D texture = new Texture2D(targetWidth, targetHeight, TextureFormat.RGBA32, false);
+            texture.ReadPixels(new Rect(0, 0, targetWidth, targetHeight), 0, 0);
+            texture.Apply();
+            return texture;
+        }
+        finally
+        {
+            cameraToRender.targetTexture = previousTarget;
+            cameraToRender.clearFlags = previousClearFlags;
+            cameraToRender.backgroundColor = previousBackgroundColor;
+            RenderTexture.active = previousActive;
+            RenderTexture.ReleaseTemporary(renderTexture);
+        }
+    }
+
+    private Camera ResolveScreenshotCamera()
+    {
+        Camera cam = Camera.main;
+        if (cam != null)
+        {
+            return cam;
+        }
+
+        var rig = FindAnyObjectByType<OVRCameraRig>();
+        return rig != null && rig.centerEyeAnchor != null
+            ? rig.centerEyeAnchor.GetComponent<Camera>()
+            : null;
+    }
+
+    private void CompositeOverlayOntoBackground(Texture2D background, Texture2D overlay)
+    {
+        Color32[] backgroundPixels = background.GetPixels32();
+        Color32[] overlayPixels = overlay.GetPixels32();
+        int count = Mathf.Min(backgroundPixels.Length, overlayPixels.Length);
+
+        for (int i = 0; i < count; i++)
+        {
+            Color32 overlayPixel = overlayPixels[i];
+            float alpha = overlayPixel.a / 255f;
+            if (alpha <= 0.01f)
+            {
+                continue;
+            }
+
+            float inverseAlpha = 1f - alpha;
+            Color32 backgroundPixel = backgroundPixels[i];
+            backgroundPixels[i] = new Color32(
+                (byte)Mathf.Clamp(Mathf.RoundToInt(overlayPixel.r * alpha + backgroundPixel.r * inverseAlpha), 0, 255),
+                (byte)Mathf.Clamp(Mathf.RoundToInt(overlayPixel.g * alpha + backgroundPixel.g * inverseAlpha), 0, 255),
+                (byte)Mathf.Clamp(Mathf.RoundToInt(overlayPixel.b * alpha + backgroundPixel.b * inverseAlpha), 0, 255),
+                255);
+        }
+
+        background.SetPixels32(backgroundPixels);
+        background.Apply();
+    }
+
+    private void AddTemporaryHiddenObject(List<TemporaryHiddenObject> hiddenObjects, GameObject objectToHide)
+    {
+        if (objectToHide == null)
+        {
+            return;
+        }
+
+        foreach (var hiddenObject in hiddenObjects)
+        {
+            if (hiddenObject.gameObject == objectToHide)
+            {
+                return;
+            }
+        }
+
+        bool wasActive = objectToHide.activeSelf;
+        hiddenObjects.Add(new TemporaryHiddenObject(objectToHide, wasActive));
+
+        if (wasActive)
+        {
+            objectToHide.SetActive(false);
+        }
+    }
+
+    private void RestoreTemporarilyHiddenObjects(List<TemporaryHiddenObject> hiddenObjects)
+    {
+        foreach (var hiddenObject in hiddenObjects)
+        {
+            if (hiddenObject.gameObject != null)
+            {
+                hiddenObject.gameObject.SetActive(hiddenObject.wasActive);
+            }
+        }
+    }
+
+    private GameObject ResolveNavigationButtonGroup()
+    {
+        UnityEngine.UI.Button[] knownNavigationButtons =
+        {
+            soloFotoButton,
+            coFotoButton,
+            remixFotoButton,
+            loadFotoButton,
+            saveFotoButton,
+            printFotoButton
+        };
+
+        foreach (var button in knownNavigationButtons)
+        {
+            if (button != null && button.transform.parent != null)
+            {
+                return button.transform.parent.gameObject;
+            }
+        }
+
+        return FindSceneGameObjectByName("navigation");
+    }
+
+    private GameObject ResolveHandMenuCanvas()
+    {
+        return FindSceneGameObjectByName("Hand Canvas");
+    }
+
+    private GameObject FindSceneGameObjectByName(string objectName)
+    {
+        GameObject[] objects = Resources.FindObjectsOfTypeAll<GameObject>();
+        foreach (var obj in objects)
+        {
+            if (obj != null && obj.scene.IsValid() && obj.name == objectName)
+            {
+                return obj;
+            }
+        }
+
+        return null;
     }
 
     private GameObject ResolveAnimatedInstructionHand()
@@ -1278,12 +1663,6 @@ if (liveMaskAndCapture != null)
                     // Add to tracking list for cleanup
                     currentlyLoadedPlanes.Add(loadedPlane);
 
-                    // Optionally parent it
-                    if (loadedPlanesParent != null)
-                    {
-                        loadedPlane.transform.SetParent(loadedPlanesParent);
-                    }
-
                     loadedCount++;
                     Debug.LogError($"[PanelNavigationManager] ✓ Loaded: {metadata.imagePath} at position {metadata.position}");
                 }
@@ -1295,12 +1674,29 @@ if (liveMaskAndCapture != null)
             }
 
             Debug.LogError($"[PanelNavigationManager] ✅✅✅ Scene loaded: {loadedCount}/{sceneData.images.Count} images");
+
+            if (loadedCount > 0)
+            {
+                ClosePanelsAfterSceneLoaded();
+            }
         }
         catch (System.Exception e)
         {
             Debug.LogError($"[PanelNavigationManager] ❌ Failed to load scene: {e.Message}");
             Debug.LogError($"[PanelNavigationManager] Stack trace: {e.StackTrace}");
         }
+    }
+
+    private void ClosePanelsAfterSceneLoaded()
+    {
+        if (InstructionManager.Instance != null)
+        {
+            InstructionManager.Instance.SetPanel(InstructionManager.InstructionPanel.None);
+        }
+
+        DeactivateAllPanels();
+        currentPanel = InstructionManager.InstructionPanel.None;
+        Debug.LogError("[PanelNavigationManager] Load panel hidden after scene load");
     }
 
     /// <summary>
@@ -1339,12 +1735,6 @@ if (liveMaskAndCapture != null)
 
         // Create the plane GameObject
         GameObject loadedPlane = CreateLoadedPlane(texture, spawnPosition, spawnRotation, planeScale);
-
-        // Optionally parent it for organization
-        if (loadedPlanesParent != null)
-        {
-            loadedPlane.transform.SetParent(loadedPlanesParent);
-        }
 
         Debug.Log($"[PanelNavigationManager] ✓ Spawned loaded image plane at {spawnPosition}");
         Debug.Log($"[PanelNavigationManager] Plane size: {planeWidth:F3}x{planeHeight:F3}m (aspect ratio: {aspectRatio:F2})");
@@ -1916,6 +2306,86 @@ private void HandleInstructionVisibility(int captureCount, int visibleHands)
         Debug.LogError($"[PanelNavigationManager] ★★★ Set {instructions.Length} instruction objects to {(visible ? "VISIBLE" : "HIDDEN")} ★★★");
     }
 
+    private void UpdateInstructionCanvasAnchor()
+    {
+        if (!anchorInstructionCanvasToLeftHand)
+        {
+            return;
+        }
+
+        Transform canvasTransform = ResolveInstructionCanvasTransform();
+        Transform handAnchor = ResolveLeftHandInstructionAnchor();
+        Camera cam = ResolveScreenshotCamera();
+
+        if (canvasTransform == null || handAnchor == null || cam == null)
+        {
+            return;
+        }
+
+        Vector3 targetPosition =
+            handAnchor.position +
+            cam.transform.right * leftHandInstructionOffset.x +
+            Vector3.up * leftHandInstructionOffset.y +
+            cam.transform.forward * leftHandInstructionOffset.z;
+
+        Quaternion targetRotation = cam.transform.rotation;
+
+        if (!hasPositionedInstructionCanvas || instructionCanvasAnchorSmoothing <= 0f)
+        {
+            canvasTransform.position = targetPosition;
+            canvasTransform.rotation = targetRotation;
+            hasPositionedInstructionCanvas = true;
+            return;
+        }
+
+        float t = 1f - Mathf.Exp(-instructionCanvasAnchorSmoothing * Time.deltaTime);
+        canvasTransform.position = Vector3.Lerp(canvasTransform.position, targetPosition, t);
+        canvasTransform.rotation = Quaternion.Slerp(canvasTransform.rotation, targetRotation, t);
+    }
+
+    private Transform ResolveInstructionCanvasTransform()
+    {
+        if (instructionCanvasTransform != null)
+        {
+            return instructionCanvasTransform;
+        }
+
+        if (resolvedInstructionCanvasTransform != null)
+        {
+            return resolvedInstructionCanvasTransform;
+        }
+
+        GameObject canvasObject = FindSceneGameObjectByName("Instructions Canvas");
+        resolvedInstructionCanvasTransform = canvasObject != null ? canvasObject.transform : null;
+        return resolvedInstructionCanvasTransform;
+    }
+
+    private Transform ResolveLeftHandInstructionAnchor()
+    {
+        if (leftHandInstructionAnchor != null)
+        {
+            return leftHandInstructionAnchor;
+        }
+
+        if (leftHand != null && leftHand.IsTracked)
+        {
+            return leftHand.transform;
+        }
+
+        if (resolvedLeftHandInstructionAnchor != null)
+        {
+            return resolvedLeftHandInstructionAnchor;
+        }
+
+        GameObject leftHandAnchorObject =
+            FindSceneGameObjectByName("LeftHandAnchorDetached") ??
+            FindSceneGameObjectByName("LeftHandAnchor") ??
+            FindSceneGameObjectByName("LeftHandOnControllerAnchor");
+
+        resolvedLeftHandInstructionAnchor = leftHandAnchorObject != null ? leftHandAnchorObject.transform : null;
+        return resolvedLeftHandInstructionAnchor;
+    }
+
     /// <summary>
     /// Get total number of captures across both systems
     /// </summary>
@@ -1980,4 +2450,3 @@ private void HandleInstructionVisibility(int captureCount, int visibleHands)
         return count;
     }
 }
-
